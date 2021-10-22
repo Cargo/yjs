@@ -21,7 +21,8 @@ class StackItem {
    * @param {DeleteSet} deletions
    * @param {DeleteSet} insertions
    */
-  constructor (deletions, insertions) {
+  constructor (undoManager, deletions, insertions) {
+    this.undoManager = undoManager
     this.insertions = insertions
     this.deletions = deletions
     /**
@@ -29,31 +30,25 @@ class StackItem {
      */
     this.meta = new Map()
   }
-}
 
-/**
- * @param {UndoManager} undoManager
- * @param {Array<StackItem>} stack
- * @param {string} eventType
- * @return {StackItem?}
- */
-const popStackItem = (undoManager, stack, eventType) => {
-  /**
-   * Whether a change happened
-   * @type {StackItem?}
-   */
-  let result = null
-  /**
-   * Keep a reference to the transaction so we can fire the event with the changedParentTypes
-   * @type {any}
-   */
-  let _tr = null
-  const doc = undoManager.doc
-  const scope = undoManager.scope
-  transact(doc, transaction => {
-    while (stack.length > 0 && result === null) {
+  undo() {
+
+    /**
+     * Whether a change happened
+     * @type {StackItem?}
+     */
+    let result = null
+    /**
+     * Keep a reference to the transaction so we can fire the event with the changedParentTypes
+     * @type {any}
+     */
+    let _tr = null
+    const doc = this.undoManager.doc
+    const scope = this.undoManager.scope
+    transact(doc, transaction => {
+
       const store = doc.store
-      const stackItem = /** @type {StackItem} */ (stack.pop())
+      const stackItem = /** @type {StackItem} */ this
       /**
        * @type {Set<Item>}
        */
@@ -94,26 +89,58 @@ const popStackItem = (undoManager, stack, eventType) => {
       // parents, so we have more information available when items are filtered.
       for (let i = itemsToDelete.length - 1; i >= 0; i--) {
         const item = itemsToDelete[i]
-        if (undoManager.deleteFilter(item)) {
+        if (this.undoManager.deleteFilter(item)) {
           item.delete(transaction)
           performedChange = true
         }
       }
+
       result = performedChange ? stackItem : null
+
+      transaction.changed.forEach((subProps, type) => {
+        // destroy search marker if necessary
+        if (subProps.has(null) && type._searchMarker) {
+          type._searchMarker.length = 0
+        }
+      })
+      _tr = transaction
+    }, this.undoManager);
+
+    return {
+      result,
+      transaction: _tr
     }
-    transaction.changed.forEach((subProps, type) => {
-      // destroy search marker if necessary
-      if (subProps.has(null) && type._searchMarker) {
-        type._searchMarker.length = 0
+
+  }
+
+  redo() {
+
+    /**
+     * Ideally we'd implement a redo here so we don't have to derive undo
+     * stack items from observing undo transactions. 
+     * 
+     * That way we can keep the stackItems in memory and preserve meta data
+     * 
+     */
+
+  }
+
+  merge(deletions, insertions) {
+
+    this.deletions = mergeDeleteSets([this.deletions, deletions])
+    this.insertions = mergeDeleteSets([this.insertions, insertions])
+
+  }
+
+  destroy(transaction) {
+
+    iterateDeletedStructs(transaction, stackItem.deletions, item => {
+      if (item instanceof Item && this.scope.some(type => isParentOf(type, item))) {
+        keepItem(item, false)
       }
     })
-    _tr = transaction
-  }, undoManager)
-  if (result != null) {
-    const changedParentTypes = _tr.changedParentTypes
-    undoManager.emit('stack-item-popped', [{ stackItem: result, type: eventType, changedParentTypes }, undoManager])
+
   }
-  return result
 }
 
 /**
@@ -140,12 +167,24 @@ export class UndoManager extends Observable {
    * @param {AbstractType<any>|Array<AbstractType<any>>} typeScope Accepts either a single type, or an array of types
    * @param {UndoManagerOptions} options
    */
-  constructor (typeScope, { captureTimeout = 500, deleteFilter = () => true, trackedOrigins = new Set([null]) } = {}) {
+  constructor (typeScope, { captureTimeout = 500, deleteFilter = () => true, trackedOrigins, ignoredOrigins } = {}) {
     super()
     this.scope = typeScope instanceof Array ? typeScope : [typeScope]
     this.deleteFilter = deleteFilter
-    trackedOrigins.add(this)
+
     this.trackedOrigins = trackedOrigins
+    this.ignoredOrigins = ignoredOrigins
+
+    // Preserve existing default behavior
+    if(this.trackedOrigins && this.ignoredOrigins) {
+      throw 'Cannot mix trackedOrigins and ignoredOrigins options'
+    }
+
+    if(this.trackedOrigins) {
+      this.trackedOrigins.add(this);
+      this.trackedOrigins.add(null);
+    }
+
     /**
      * @type {Array<StackItem>}
      */
@@ -165,9 +204,23 @@ export class UndoManager extends Observable {
     this.lastChange = 0
     this.doc.on('afterTransaction', /** @param {Transaction} transaction */ transaction => {
       // Only track certain transactions
-      if (!this.scope.some(type => transaction.changedParentTypes.has(type)) || (!this.trackedOrigins.has(transaction.origin) && (!transaction.origin || !this.trackedOrigins.has(transaction.origin.constructor)))) {
+       // if this undoManager is disconnected or the transaction is not within the scope of this undoManager
+      if(this.disconnected || !this.scope.some(type => transaction.changedParentTypes.has(type))) {
         return
       }
+
+      // if trackedOrigins is passed, only listen to changes originating from this this.trackedOrigins
+      if (this.trackedOrigins && !this.trackedOrigins.has(transaction.origin) && (!transaction.origin || !this.trackedOrigins.has(transaction.origin.constructor))) {
+        //console.log('trackedOrigins hit', transaction)
+        return
+      }
+
+      // if ignoredOrigins is passed, only listen to changes _not_ originating from this this.ignoredOrigins
+      if (this.ignoredOrigins && (this.ignoredOrigins.has(transaction.origin) || (transaction.origin && this.ignoredOrigins.has(transaction.origin.constructor)))) {
+        //console.log('ignoredOrigins hit', transaction)
+        return
+      }
+
       const undoing = this.undoing
       const redoing = this.redoing
       const stack = undoing ? this.redoStack : this.undoStack
@@ -188,12 +241,10 @@ export class UndoManager extends Observable {
       const now = time.getUnixTime()
       if (now - this.lastChange < captureTimeout && stack.length > 0 && !undoing && !redoing) {
         // append change to last stack op
-        const lastOp = stack[stack.length - 1]
-        lastOp.deletions = mergeDeleteSets([lastOp.deletions, transaction.deleteSet])
-        lastOp.insertions = mergeDeleteSets([lastOp.insertions, insertions])
+        stack[stack.length - 1].merge(transaction.deleteSet, insertions);
       } else {
         // create a new stack op
-        stack.push(new StackItem(transaction.deleteSet, insertions))
+        stack.push(new StackItem(this, transaction.deleteSet, insertions))
       }
       if (!undoing && !redoing) {
         this.lastChange = now
@@ -210,18 +261,8 @@ export class UndoManager extends Observable {
 
   clear () {
     this.doc.transact(transaction => {
-      /**
-       * @param {StackItem} stackItem
-       */
-      const clearItem = stackItem => {
-        iterateDeletedStructs(transaction, stackItem.deletions, item => {
-          if (item instanceof Item && this.scope.some(type => isParentOf(type, item))) {
-            keepItem(item, false)
-          }
-        })
-      }
-      this.undoStack.forEach(clearItem)
-      this.redoStack.forEach(clearItem)
+      this.undoStack.forEach(stackItem => stackItem.destroy(transaction))
+      this.redoStack.forEach(stackItem => stackItem.destroy(transaction))
     })
     this.undoStack = []
     this.redoStack = []
@@ -258,13 +299,25 @@ export class UndoManager extends Observable {
    */
   undo () {
     this.undoing = true
-    let res
+
+    let result = null;
+    let transaction;
+
     try {
-      res = popStackItem(this, this.undoStack, 'undo')
+
+      while (this.undoStack.length > 0 && result === null) {
+        ({ result, transaction } = (this.undoStack.pop())?.undo())
+      }
+
+      if (result != null) {
+        const changedParentTypes = transaction.changedParentTypes
+        this.emit('stack-item-popped', [{ stackItem: result, type: 'undo', changedParentTypes }, this])
+      }
+
     } finally {
       this.undoing = false
     }
-    return res
+    return result
   }
 
   /**
@@ -274,12 +327,23 @@ export class UndoManager extends Observable {
    */
   redo () {
     this.redoing = true
-    let res
+
+    let result = null;
+    let transaction;
+
     try {
-      res = popStackItem(this, this.redoStack, 'redo')
+      while (this.redoStack.length > 0 && result === null) {
+        ({ result, transaction } = (this.redoStack.pop())?.undo())
+      }
+
+      if (result != null) {
+        const changedParentTypes = transaction.changedParentTypes
+        this.emit('stack-item-popped', [{ stackItem: result, type: 'redo', changedParentTypes }, this])
+      }
+
     } finally {
       this.redoing = false
     }
-    return res
+    return result
   }
 }
