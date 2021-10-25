@@ -21,17 +21,34 @@ class StackItem {
    * @param {DeleteSet} deletions
    * @param {DeleteSet} insertions
    */
-  constructor (undoManager, deletions, insertions) {
+  constructor (undoManager, transaction) {
     this.undoManager = undoManager
-    this.insertions = insertions
-    this.deletions = deletions
+
+    this.insertions = new DeleteSet()
+    this.deletions = transaction.deleteSet;
+
+    transaction.afterState.forEach((endClock, client) => {
+      const startClock = transaction.beforeState.get(client) || 0
+      const len = endClock - startClock
+      if (len > 0) {
+        addToDeleteSet(this.insertions, client, startClock, len)
+      }
+    })
+
+    // make sure that deleted structs are not gc'd
+    iterateDeletedStructs(transaction, transaction.deleteSet, /** @param {Item|GC} item */ item => {
+      if (item instanceof Item && this.scope.some(type => isParentOf(type, item))) {
+        keepItem(item, true)
+      }
+    })
+
     /**
      * Use this to save and restore metadata like selection range
      */
     this.meta = new Map()
   }
 
-  undo() {
+  apply() {
 
     /**
      * Whether a change happened
@@ -113,22 +130,12 @@ class StackItem {
 
   }
 
-  redo() {
+  merge(stackItem) {
 
-    /**
-     * Ideally we'd implement a redo here so we don't have to derive undo
-     * stack items from observing undo transactions. 
-     * 
-     * That way we can keep the stackItems in memory and preserve meta data
-     * 
-     */
+    // also merge meta
 
-  }
-
-  merge(deletions, insertions) {
-
-    this.deletions = mergeDeleteSets([this.deletions, deletions])
-    this.insertions = mergeDeleteSets([this.insertions, insertions])
+    this.deletions = mergeDeleteSets([this.deletions, stackItem.deletions])
+    this.insertions = mergeDeleteSets([this.insertions, stackItem.insertions])
 
   }
 
@@ -230,31 +237,18 @@ export class UndoManager extends Observable {
         // neither undoing nor redoing: delete redoStack
         this.redoStack = []
       }
-      const insertions = new DeleteSet()
-      transaction.afterState.forEach((endClock, client) => {
-        const startClock = transaction.beforeState.get(client) || 0
-        const len = endClock - startClock
-        if (len > 0) {
-          addToDeleteSet(insertions, client, startClock, len)
-        }
-      })
+
       const now = time.getUnixTime()
       if (now - this.lastChange < captureTimeout && stack.length > 0 && !undoing && !redoing) {
         // append change to last stack op
-        stack[stack.length - 1].merge(transaction.deleteSet, insertions);
+        stack[stack.length - 1].merge(new StackItem(this, transaction));
       } else {
         // create a new stack op
-        stack.push(new StackItem(this, transaction.deleteSet, insertions))
+        stack.push(new StackItem(this, transaction))
       }
       if (!undoing && !redoing) {
         this.lastChange = now
       }
-      // make sure that deleted structs are not gc'd
-      iterateDeletedStructs(transaction, transaction.deleteSet, /** @param {Item|GC} item */ item => {
-        if (item instanceof Item && this.scope.some(type => isParentOf(type, item))) {
-          keepItem(item, true)
-        }
-      })
       this.emit('stack-item-added', [{ stackItem: stack[stack.length - 1], origin: transaction.origin, type: undoing ? 'redo' : 'undo', changedParentTypes: transaction.changedParentTypes }, this])
     })
   }
@@ -306,7 +300,7 @@ export class UndoManager extends Observable {
     try {
 
       while (this.undoStack.length > 0 && result === null) {
-        ({ result, transaction } = (this.undoStack.pop())?.undo())
+        ({ result, transaction } = (this.undoStack.pop())?.apply())
       }
 
       if (result != null) {
@@ -333,7 +327,7 @@ export class UndoManager extends Observable {
 
     try {
       while (this.redoStack.length > 0 && result === null) {
-        ({ result, transaction } = (this.redoStack.pop())?.undo())
+        ({ result, transaction } = (this.redoStack.pop())?.apply())
       }
 
       if (result != null) {
